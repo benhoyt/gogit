@@ -40,17 +40,20 @@ func main() {
 		// "gogit commit" is different from "git commit": for simplicity, gogit
 		// doesn't maintain the git index (staging area), so you have to
 		// specify the list of paths you want committed each time.
-		var (
-			author  string
-			message string
-		)
-		flagSet := flag.NewFlagSet("gogit commit --author 'name <email>' -m 'message' paths...", flag.ExitOnError)
-		flagSet.StringVar(&author, "author", "", "commit author (required)")
+		var message string
+		flagSet := flag.NewFlagSet("gogit commit -m 'message' paths...", flag.ExitOnError)
 		flagSet.StringVar(&message, "m", "", "commit message (required)")
 		flagSet.Parse(os.Args[2:])
-		if author == "" || message == "" || len(flagSet.Args()) == 0 {
+		if message == "" || len(flagSet.Args()) == 0 {
 			flagSet.Usage()
 		}
+		authorName := os.Getenv("GIT_AUTHOR_NAME")
+		authorEmail := os.Getenv("GIT_AUTHOR_EMAIL")
+		if authorName == "" || authorEmail == "" {
+			fmt.Fprintln(os.Stderr, "GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL must be set")
+			os.Exit(1)
+		}
+		author := fmt.Sprintf("%s <%s>", authorName, authorEmail)
 		hash, err := commit(message, author, flagSet.Args())
 		check(err)
 		fmt.Printf("committed %s to master\n", hash[:7])
@@ -69,7 +72,11 @@ func main() {
 		}
 		remote, local, num, err := push(gitURL, username, password)
 		check(err)
-		fmt.Printf("updating remote master from %s to %s (%d objects)\n", remote[:7], local[:7], num)
+		if num == 0 {
+			fmt.Printf("local and remote at %s, nothing to update\n", local[:7])
+		} else {
+			fmt.Printf("updating remote master from %s to %s (%d objects)\n", remote[:7], local[:7], num)
+		}
 
 	default:
 		usage()
@@ -281,6 +288,9 @@ func push(gitURL, username, password string) (remoteHash, localHash string, num 
 	if err != nil {
 		return "", "", 0, err
 	}
+	if len(missing) == 0 {
+		return remoteHash, localHash, 0, nil
+	}
 	if remoteHash == "" {
 		remoteHash = strings.Repeat("0", 40)
 	}
@@ -321,7 +331,6 @@ func push(gitURL, username, password string) (remoteHash, localHash string, num 
 	if response.StatusCode != 200 {
 		return "", "", 0, fmt.Errorf("expected status 200, got %d", response.StatusCode)
 	}
-	os.Stdout.Write(data)
 	lines, err := extractLines(data)
 	if err != nil {
 		return "", "", 0, err
@@ -367,10 +376,9 @@ func getRemoteHash(client *http.Client, gitURL, username, password string) (stri
 	if lines[2][:40] == strings.Repeat("0", 40) {
 		return "", nil
 	}
-	hash, ref, ok := strings.Cut(lines[2], "\x00")
-	if !ok {
-		return "", fmt.Errorf("expected hash and ref, got %q", lines[2])
-	}
+	hashRef := strings.Split(lines[2], "\x00")[0]
+	fields := strings.Fields(hashRef)
+	hash, ref := fields[0], fields[1]
 	if ref != "refs/heads/master" {
 		return "", fmt.Errorf(`expected "refs/heads/master", got %q`, ref)
 	}
@@ -549,7 +557,6 @@ func createPack(objects []string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		fmt.Fprintf(os.Stderr, "encoded pack object %s, %d bytes\n", object, len(data))
 		buf.Write(data)
 	}
 	sha := sha1.New()
