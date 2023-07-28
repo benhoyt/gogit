@@ -29,12 +29,12 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		fmt.Fprintln(os.Stderr, "usage: gogit init|commit|push [...]")
+		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "init":
-		err := initRepo()
-		check(err)
+		initRepo()
 
 	case "commit":
 		// "gogit commit" is different from "git commit": for simplicity, gogit
@@ -46,6 +46,7 @@ func main() {
 		flagSet.Parse(os.Args[2:])
 		if message == "" || len(flagSet.Args()) == 0 {
 			flagSet.Usage()
+			os.Exit(1)
 		}
 		authorName := os.Getenv("GIT_AUTHOR_NAME")
 		authorEmail := os.Getenv("GIT_AUTHOR_EMAIL")
@@ -54,8 +55,7 @@ func main() {
 			os.Exit(1)
 		}
 		author := fmt.Sprintf("%s <%s>", authorName, authorEmail)
-		hash, err := commit(message, author, flagSet.Args())
-		check(err)
+		hash := commit(message, author, flagSet.Args())
 		fmt.Printf("committed %s to master\n", hash[:7])
 
 	case "push":
@@ -70,8 +70,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "GIT_USERNAME and GIT_PASSWORD must be set")
 			os.Exit(1)
 		}
-		remote, local, num, err := push(gitURL, username, password)
-		check(err)
+		remote, local, num := push(gitURL, username, password)
 		if num == 0 {
 			fmt.Printf("local and remote at %s, nothing to update\n", local[:7])
 		} else {
@@ -79,39 +78,41 @@ func main() {
 		}
 
 	default:
-		usage()
+		fmt.Fprintln(os.Stderr, "usage: gogit init|commit|push [...]")
+		os.Exit(2)
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gogit [cat-file|commit|init|hash-object|push|...]")
-	os.Exit(2)
+func check0(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
 
-func check(err error) {
+func check[T any](value T, err error) T {
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		panic(err)
+	}
+	return value
+}
+
+func assert(cond bool, format string, args ...any) {
+	if !cond {
+		panic(fmt.Sprintf(format, args...))
 	}
 }
 
 // Create the directories and files required to initialise a git repo.
-func initRepo() error {
+func initRepo() {
 	for _, name := range []string{".git/objects", ".git/refs/heads"} {
-		err := os.MkdirAll(name, 0o775)
-		if err != nil {
-			return err
-		}
+		check0(os.MkdirAll(name, 0o775))
 	}
-	return os.WriteFile(".git/HEAD", []byte("ref: refs/heads/master"), 0o664)
+	check0(os.WriteFile(".git/HEAD", []byte("ref: refs/heads/master"), 0o664))
 }
 
 // Commit tree of given paths to master, returning the commit hash.
-func commit(message, author string, paths []string) (string, error) {
-	tree, err := writeTree(paths)
-	if err != nil {
-		return "", err
-	}
+func commit(message, author string, paths []string) string {
+	tree := writeTree(paths)
 	var buf bytes.Buffer
 	fmt.Fprintln(&buf, "tree", hex.EncodeToString(tree))
 	parent := getLocalHash()
@@ -125,44 +126,27 @@ func commit(message, author string, paths []string) (string, error) {
 	fmt.Fprintln(&buf)
 	fmt.Fprintln(&buf, message)
 	data := buf.Bytes()
-	hash, err := hashObject("commit", data)
-	if err != nil {
-		return "", err
-	}
-	err = os.WriteFile(".git/refs/heads/master", []byte(hex.EncodeToString(hash)+"\n"), 0o664)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash), nil
+	hash := hashObject("commit", data)
+	check0(os.WriteFile(".git/refs/heads/master", []byte(hex.EncodeToString(hash)+"\n"), 0o664))
+	return hex.EncodeToString(hash)
 }
 
 // Write a "tree" object with the given paths (sub-trees are not supported).
-func writeTree(paths []string) ([]byte, error) {
+func writeTree(paths []string) []byte {
 	sort.Strings(paths) // tree object needs paths sorted
 	var buf bytes.Buffer
 	for _, path := range paths {
-		st, err := os.Stat(path)
-		if err != nil {
-			return nil, err
-		}
-		if st.IsDir() {
-			panic("sub-trees not supported")
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		hash, err := hashObject("blob", data)
-		if err != nil {
-			return nil, err
-		}
+		st := check(os.Stat(path))
+		assert(!st.IsDir(), "sub-trees not supported")
+		data := check(os.ReadFile(path))
+		hash := hashObject("blob", data)
 		fmt.Fprintf(&buf, "%o %s\x00%s", st.Mode().Perm()|0o100000, path, hash)
 	}
 	return hashObject("tree", buf.Bytes())
 }
 
 // Hash and write the given data as a git object of the given type.
-func hashObject(objType string, data []byte) ([]byte, error) {
+func hashObject(objType string, data []byte) []byte {
 	sha := sha1.New()
 	header := fmt.Sprintf("%s %d\x00", objType, len(data))
 	io.WriteString(sha, header) // these writes can't fail
@@ -170,23 +154,12 @@ func hashObject(objType string, data []byte) ([]byte, error) {
 	hash := sha.Sum(nil)
 	hashStr := hex.EncodeToString(hash)
 	path := filepath.Join(".git/objects", hashStr[:2], hashStr[2:])
-	err := os.MkdirAll(filepath.Dir(path), 0o775)
-	if err != nil {
-		return nil, err
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close() // doesn't hurt to call f.Close() twice (also below)
-
-	compressed, err := compress(append([]byte(header), data...))
-	_, err = f.Write(compressed)
-	if err != nil {
-		return nil, err
-	}
-	err = f.Close()
-	return hash, err
+	check0(os.MkdirAll(filepath.Dir(path), 0o775))
+	f := check(os.Create(path))
+	compressed := compress(append([]byte(header), data...))
+	check(f.Write(compressed))
+	check0(f.Close())
+	return hash
 }
 
 // Return current commit hash of the local master branch.
@@ -199,193 +172,89 @@ func getLocalHash() string {
 }
 
 // Read git object with given hash (or hash prefix).
-func readObject(hashPrefix string) (objType string, data []byte, err error) {
-	path, err := findObject(hashPrefix)
-	if err != nil {
-		return "", nil, err
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return "", nil, err
-	}
+func readObject(hashPrefix string) (objType string, data []byte) {
+	path := findObject(hashPrefix)
+	f := check(os.Open(path))
 	defer f.Close()
-	decompressor, err := zlib.NewReader(f)
-	if err != nil {
-		return "", nil, err
-	}
+	decompressor := check(zlib.NewReader(f))
 	var buf bytes.Buffer
-	_, err = io.Copy(&buf, decompressor)
-	if err != nil {
-		return "", nil, err
-	}
-	err = decompressor.Close()
-	if err != nil {
-		return "", nil, err
-	}
+	check(io.Copy(&buf, decompressor))
+	check0(decompressor.Close())
 	fullData := buf.Bytes()
-
-	nulIndex := bytes.IndexByte(fullData, 0)
-	if nulIndex < 0 {
-		return "", nil, fmt.Errorf("invalid object data: no NUL byte")
-	}
-	header := fullData[:nulIndex]
+	header, data, ok := bytes.Cut(fullData, []byte{0})
+	assert(ok, "invalid object data: no NUL byte")
 	objType, sizeStr, ok := strings.Cut(string(header), " ")
-	if !ok {
-		return "", nil, fmt.Errorf("invalid object header")
-	}
-	size, err := strconv.Atoi(sizeStr)
-	if err != nil {
-		return "", nil, fmt.Errorf("invalid object header: invalid size")
-	}
-	data = fullData[nulIndex+1:]
-	if size != len(data) {
-		return "", nil, fmt.Errorf("invalid object: expected size %d, got %d",
-			size, len(data))
-	}
-	return objType, data, nil
+	assert(ok, "invalid object header")
+	size := check(strconv.Atoi(sizeStr))
+	assert(size == len(data), "invalid object: expected size %d, got %d", size, len(data))
+	return objType, data
 }
 
 // Find object with given hash prefix and return full hash, or error if not found.
-func findObject(hashPrefix string) (string, error) {
-	if len(hashPrefix) < 2 {
-		return "", fmt.Errorf("hash prefix must be 2 or more characters")
-	}
+func findObject(hashPrefix string) string {
 	objDir := filepath.Join(".git/objects", hashPrefix[:2])
 	rest := hashPrefix[2:]
 	entries, err := os.ReadDir(objDir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("object %q not found", hashPrefix)
-		}
-		return "", err
-	}
+	assert(!errors.Is(err, fs.ErrNotExist), "object %q not found", hashPrefix)
+	check0(err)
 	var match string
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), rest) {
-			if match != "" {
-				return "", fmt.Errorf("multiple objects with prefix %q", hashPrefix)
-			}
+			assert(match == "", "multiple objects with prefix %q", hashPrefix)
 			match = entry.Name()
 		}
 	}
-	if match == "" {
-		return "", fmt.Errorf("object %q not found", hashPrefix)
-	}
-	return filepath.Join(objDir, match), nil
+	assert(match != "", "object %q not found", hashPrefix)
+	return filepath.Join(objDir, match)
 }
 
 // Push master branch (and missing objects) to remote.
-func push(gitURL, username, password string) (remoteHash, localHash string, num int, err error) {
+func push(gitURL, username, password string) (remoteHash, localHash string, num int) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	remoteHash, err = getRemoteHash(client, gitURL, username, password)
-	if err != nil {
-		return "", "", 0, err
-	}
+	remoteHash = getRemoteHash(client, gitURL, username, password)
 	localHash = getLocalHash()
-
-	missing, err := findMissingObjects(localHash, remoteHash)
-	if err != nil {
-		return "", "", 0, err
-	}
+	missing := findMissingObjects(localHash, remoteHash)
 	if len(missing) == 0 {
-		return remoteHash, localHash, 0, nil
+		return remoteHash, localHash, 0
 	}
 	if remoteHash == "" {
 		remoteHash = strings.Repeat("0", 40)
 	}
-	line := fmt.Sprintf("%s %s refs/heads/master\x00 report-status\n",
-		remoteHash, localHash)
-	packData, err := createPack(missing)
-	if err != nil {
-		return "", "", 0, err
-	}
+	line := fmt.Sprintf("%s %s refs/heads/master\x00 report-status\n", remoteHash, localHash)
+	packData := createPack(missing)
 	sendData := append([]byte(fmt.Sprintf("%04x%s0000", len(line)+4, line)), packData...)
-
-	fout, err := os.Create("test.pack")
-	if err != nil {
-		return "", "", 0, err
-	}
-	_, err = fout.Write(sendData)
-	if err != nil {
-		return "", "", 0, err
-	}
-	err = fout.Close()
-	if err != nil {
-		return "", "", 0, err
-	}
-	request, err := http.NewRequest("POST", gitURL+"/git-receive-pack", bytes.NewReader(sendData))
-	if err != nil {
-		return "", "", 0, err
-	}
+	request := check(http.NewRequest("POST", gitURL+"/git-receive-pack", bytes.NewReader(sendData)))
 	addBasicAuth(request, username, password)
-	response, err := client.Do(request)
-	if err != nil {
-		return "", "", 0, err
-	}
+	response := check(client.Do(request))
 	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		return "", "", 0, err
-	}
-	if response.StatusCode != 200 {
-		return "", "", 0, fmt.Errorf("expected status 200, got %d", response.StatusCode)
-	}
-	lines, err := extractLines(data)
-	if err != nil {
-		return "", "", 0, err
-	}
-	if lines[0] != "unpack ok\n" {
-		return "", "", 0, fmt.Errorf(`expected line 1 to be "unpack ok\n", got %q`, lines[0])
-	}
-	if lines[1] != "ok refs/heads/master\n" {
-		return "", "", 0, fmt.Errorf(`expected line 2 to be "ok refs/heads/master\n", got %q`, lines[1])
-	}
-	return remoteHash, localHash, len(missing), nil
+	data := check(io.ReadAll(response.Body))
+	assert(response.StatusCode == 200, "expected status 200, got %d", response.StatusCode)
+	lines := extractLines(data)
+	assert(lines[0] == "unpack ok\n", `expected line 1 to be "unpack ok\n", got %q`, lines[0])
+	assert(lines[1] == "ok refs/heads/master\n", `expected line 2 to be "ok refs/heads/master\n", got %q`, lines[1])
+	return remoteHash, localHash, len(missing)
 }
 
 // Get current hash of master branch on remote.
-func getRemoteHash(client *http.Client, gitURL, username, password string) (string, error) {
-	request, err := http.NewRequest("GET", gitURL+"/info/refs?service=git-receive-pack", nil)
-	if err != nil {
-		return "", err
-	}
+func getRemoteHash(client *http.Client, gitURL, username, password string) string {
+	request := check(http.NewRequest("GET", gitURL+"/info/refs?service=git-receive-pack", nil))
 	addBasicAuth(request, username, password)
-	response, err := client.Do(request)
-	if err != nil {
-		return "", err
-	}
+	response := check(client.Do(request))
 	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		return "", err
-	}
-	if response.StatusCode != 200 {
-		return "", fmt.Errorf("expected status 200, got %d", response.StatusCode)
-	}
-	lines, err := extractLines(data)
-	if err != nil {
-		return "", err
-	}
-	if lines[0] != "# service=git-receive-pack\n" {
-		return "", fmt.Errorf("invalid service line %q", lines[0])
-	}
-	if lines[1] != "" {
-		return "", fmt.Errorf("expected empty second line, got %q", lines[1])
-	}
+	data := check(io.ReadAll(response.Body))
+	assert(response.StatusCode == 200, "expected status 200, got %d", response.StatusCode)
+	lines := extractLines(data)
+	assert(lines[0] == "# service=git-receive-pack\n", "invalid service line %q", lines[0])
+	assert(lines[1] == "", "expected empty second line, got %q", lines[1])
 	if lines[2][:40] == strings.Repeat("0", 40) {
-		return "", nil
+		return ""
 	}
 	hashRef := strings.Split(lines[2], "\x00")[0]
 	fields := strings.Fields(hashRef)
 	hash, ref := fields[0], fields[1]
-	if ref != "refs/heads/master" {
-		return "", fmt.Errorf(`expected "refs/heads/master", got %q`, ref)
-	}
-	if len(hash) != 40 {
-		return "", fmt.Errorf("expected 40-char hash, got %q (%d)", hash, len(hash))
-	}
-	return hash, nil
+	assert(ref == "refs/heads/master", `expected "refs/heads/master", got %q`, ref)
+	assert(len(hash) == 40, "expected 40-char hash, got %q (%d)", hash, len(hash))
+	return hash
 }
 
 // Add basic authentication header to request.
@@ -396,14 +265,10 @@ func addBasicAuth(request *http.Request, username, password string) {
 }
 
 // Extract list of lines from given server data.
-func extractLines(data []byte) ([]string, error) {
+func extractLines(data []byte) []string {
 	var lines []string
-	i := 0
-	for j := 0; j < 1000 && i < len(data); j++ {
-		length, err := strconv.ParseInt(string(data[i:i+4]), 16, 32)
-		if err != nil {
-			return nil, fmt.Errorf("expected hex length, got %q", data[i:i+4])
-		}
+	for i := 0; i < len(data); {
+		length := check(strconv.ParseInt(string(data[i:i+4]), 16, 32))
 		var line []byte
 		if length != 0 {
 			line = data[i+4 : i+int(length)]
@@ -415,20 +280,14 @@ func extractLines(data []byte) ([]string, error) {
 			i += int(length)
 		}
 	}
-	return lines, nil
+	return lines
 }
 
 // Find sorted list of object hashes in local commit that are missing at the remote.
-func findMissingObjects(localHash, remoteHash string) ([]string, error) {
-	localObjects, err := findCommitObjects(localHash)
-	if err != nil {
-		return nil, err
-	}
+func findMissingObjects(localHash, remoteHash string) []string {
+	localObjects := findCommitObjects(localHash)
 	if remoteHash != "" {
-		remoteObjects, err := findCommitObjects(remoteHash)
-		if err != nil {
-			return nil, err
-		}
+		remoteObjects := findCommitObjects(remoteHash)
 		for object := range remoteObjects {
 			delete(localObjects, object)
 		}
@@ -438,20 +297,15 @@ func findMissingObjects(localHash, remoteHash string) ([]string, error) {
 		missing = append(missing, object)
 	}
 	sort.Strings(missing)
-	return missing, nil
+	return missing
 }
 
 // Find set of object hashes in this commit (recursively), its tree, its
 // parents, and the hash of the commit itself.
-func findCommitObjects(commitHash string) (map[string]struct{}, error) {
+func findCommitObjects(commitHash string) map[string]struct{} {
 	objects := map[string]struct{}{commitHash: {}}
-	objType, data, err := readObject(commitHash)
-	if err != nil {
-		return nil, err
-	}
-	if objType != "commit" {
-		return nil, fmt.Errorf("expected commit, got %s", objType)
-	}
+	objType, data := readObject(commitHash)
+	assert(objType == "commit", "expected commit, got %s", objType)
 	lines := strings.Split(string(data), "\n")
 	tree := ""
 	var parents []string
@@ -462,42 +316,27 @@ func findCommitObjects(commitHash string) (map[string]struct{}, error) {
 			parents = append(parents, line[7:47])
 		}
 	}
-	if tree == "" {
-		return nil, fmt.Errorf("tree not found in commit %s", commitHash)
-	}
-	treeObjects, err := findTreeObjects(tree)
-	if err != nil {
-		return nil, err
-	}
+	assert(tree != "", "tree not found in commit %s", commitHash)
+	treeObjects := findTreeObjects(tree)
 	for object := range treeObjects {
 		objects[object] = struct{}{}
 	}
 	for _, parent := range parents {
-		parentObjects, err := findCommitObjects(parent)
-		if err != nil {
-			return nil, err
-		}
+		parentObjects := findCommitObjects(parent)
 		for object := range parentObjects {
 			objects[object] = struct{}{}
 		}
 	}
-	return objects, nil
+	return objects
 }
 
-// Find set of object hashes in this tree (recursively), including the hash
-// of the tree itself.
-func findTreeObjects(treeHash string) (map[string]struct{}, error) {
+// Find set of object hashes in this tree, including the hash of the tree itself.
+func findTreeObjects(treeHash string) map[string]struct{} {
 	objects := map[string]struct{}{treeHash: {}}
-	entries, err := readTree(treeHash)
-	if err != nil {
-		return nil, err
-	}
+	entries := readTree(treeHash)
 	for _, entry := range entries {
 		if entry.isDir {
-			subObjects, err := findTreeObjects(entry.hash)
-			if err != nil {
-				return nil, err
-			}
+			subObjects := findTreeObjects(entry.hash)
 			for object := range subObjects {
 				objects[object] = struct{}{}
 			}
@@ -505,7 +344,7 @@ func findTreeObjects(treeHash string) (map[string]struct{}, error) {
 			objects[entry.hash] = struct{}{}
 		}
 	}
-	return objects, nil
+	return objects
 }
 
 type treeEntry struct {
@@ -514,63 +353,42 @@ type treeEntry struct {
 }
 
 // Read list of entries in tree object.
-func readTree(treeHash string) ([]treeEntry, error) {
-	objType, data, err := readObject(treeHash)
-	if err != nil {
-		return nil, err
-	}
-	if objType != "tree" {
-		return nil, fmt.Errorf("expected tree, got %s", objType)
-	}
+func readTree(treeHash string) []treeEntry {
+	objType, data := readObject(treeHash)
+	assert(objType == "tree", "expected tree, got %s", objType)
 	var entries []treeEntry
-	i := 0
-	for j := 0; j < 1000; j++ {
+	for i := 0; bytes.Contains(data[i:], []byte{0}); {
 		end := bytes.IndexByte(data[i:], 0)
-		if end < 0 {
-			break
-		}
 		chunk := string(data[i : i+end])
 		modeStr, _, ok := strings.Cut(chunk, " ")
-		if !ok {
-			return nil, fmt.Errorf("expected space in %q", chunk)
-		}
-		mode, err := strconv.ParseInt(modeStr, 8, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid mode %q", modeStr)
-		}
+		assert(ok, "expected space in %q", chunk)
+		mode := check(strconv.ParseInt(modeStr, 8, 64))
 		digest := data[i+end+1 : i+end+21]
 		entries = append(entries, treeEntry{isDir: mode&0o040000 != 0, hash: hex.EncodeToString(digest)})
 		i += end + 1 + 20
 	}
-	return entries, nil
+	return entries
 }
 
 // Create pack file containing all objects in given list of object hashes.
-func createPack(objects []string) ([]byte, error) {
+func createPack(objects []string) []byte {
 	var buf bytes.Buffer
 	header := []byte("PACK")
 	header = binary.BigEndian.AppendUint32(header, 2)
 	header = binary.BigEndian.AppendUint32(header, uint32(len(objects)))
 	buf.Write(header)
 	for _, object := range objects {
-		data, err := encodePackObject(object)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(data)
+		buf.Write(encodePackObject(object))
 	}
 	sha := sha1.New()
 	sha.Write(buf.Bytes())
 	buf.Write(sha.Sum(nil))
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
 
 // Encode a single object in pack file.
-func encodePackObject(object string) ([]byte, error) {
-	objType, data, err := readObject(object)
-	if err != nil {
-		return nil, err
-	}
+func encodePackObject(object string) []byte {
+	objType, data := readObject(object)
 	typeNum := objTypes[objType]
 	size := len(data)
 	b := byte(typeNum<<4) | byte(size&0x0f)
@@ -582,26 +400,16 @@ func encodePackObject(object string) ([]byte, error) {
 		size >>= 7
 	}
 	header = append(header, b)
-	compressed, err := compress(data)
-	if err != nil {
-		return nil, err
-	}
-	return append(header, compressed...), nil
+	return append(header, compress(data)...)
 }
 
 var objTypes = map[string]int{"commit": 1, "tree": 2, "blob": 3}
 
 // Helper to zlib-compress a slice of bytes.
-func compress(data []byte) ([]byte, error) {
+func compress(data []byte) []byte {
 	var buf bytes.Buffer
 	compressor := zlib.NewWriter(&buf)
-	_, err := compressor.Write(data)
-	if err != nil {
-		return nil, err
-	}
-	err = compressor.Close()
-	if err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	check(compressor.Write(data))
+	check0(compressor.Close())
+	return buf.Bytes()
 }
