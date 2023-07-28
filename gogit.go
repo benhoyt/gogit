@@ -154,6 +154,9 @@ func hashObject(objType string, data []byte) []byte {
 	hash := sha.Sum(nil)
 	hashStr := hex.EncodeToString(hash)
 	path := filepath.Join(".git/objects", hashStr[:2], hashStr[2:])
+	if _, err := os.Stat(path); err == nil {
+		return hash // file already exists
+	}
 	check0(os.MkdirAll(filepath.Dir(path), 0o775))
 	f := check(os.Create(path))
 	compressed := compress(append([]byte(header), data...))
@@ -332,42 +335,23 @@ func findCommitObjects(commitHash string) map[string]struct{} {
 
 // Find set of object hashes in this tree, including the hash of the tree itself.
 func findTreeObjects(treeHash string) map[string]struct{} {
-	objects := map[string]struct{}{treeHash: {}}
-	entries := readTree(treeHash)
-	for _, entry := range entries {
-		if entry.isDir {
-			subObjects := findTreeObjects(entry.hash)
-			for object := range subObjects {
-				objects[object] = struct{}{}
-			}
-		} else {
-			objects[entry.hash] = struct{}{}
-		}
-	}
-	return objects
-}
-
-type treeEntry struct {
-	isDir bool
-	hash  string
-}
-
-// Read list of entries in tree object.
-func readTree(treeHash string) []treeEntry {
 	objType, data := readObject(treeHash)
 	assert(objType == "tree", "expected tree, got %s", objType)
-	var entries []treeEntry
-	for i := 0; bytes.Contains(data[i:], []byte{0}); {
+	objects := map[string]struct{}{treeHash: {}}
+	for i := 0; ; {
 		end := bytes.IndexByte(data[i:], 0)
+		if end < 0 {
+			return objects
+		}
 		chunk := string(data[i : i+end])
 		modeStr, _, ok := strings.Cut(chunk, " ")
 		assert(ok, "expected space in %q", chunk)
 		mode := check(strconv.ParseInt(modeStr, 8, 64))
-		digest := data[i+end+1 : i+end+21]
-		entries = append(entries, treeEntry{isDir: mode&0o040000 != 0, hash: hex.EncodeToString(digest)})
+		assert(mode&0o040000 == 0, "sub-trees not supported")
+		hash := hex.EncodeToString(data[i+end+1 : i+end+21])
+		objects[hash] = struct{}{}
 		i += end + 1 + 20
 	}
-	return entries
 }
 
 // Create pack file containing all objects in given list of object hashes.
