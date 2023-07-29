@@ -13,11 +13,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -193,22 +191,20 @@ func readObject(hashPrefix string) (objType string, data []byte) {
 	return objType, data
 }
 
-// Find object with given hash prefix and return full hash, or error if not found.
+// Find object with given hash prefix and return path to object.
 func findObject(hashPrefix string) string {
 	objDir := filepath.Join(".git/objects", hashPrefix[:2])
 	rest := hashPrefix[2:]
-	entries, err := os.ReadDir(objDir)
-	assert(!errors.Is(err, fs.ErrNotExist), "object %q not found", hashPrefix)
-	check0(err)
-	var match string
+	entries, _ := os.ReadDir(objDir)
+	var matches []string
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), rest) {
-			assert(match == "", "multiple objects with prefix %q", hashPrefix)
-			match = entry.Name()
+			matches = append(matches, entry.Name())
 		}
 	}
-	assert(match != "", "object %q not found", hashPrefix)
-	return filepath.Join(objDir, match)
+	assert(len(matches) > 0, "object %q not found", hashPrefix)
+	assert(len(matches) == 1, "multiple objects with prefix %q", hashPrefix)
+	return filepath.Join(objDir, matches[0])
 }
 
 // Push master branch (and missing objects) to remote.
